@@ -1,11 +1,9 @@
+import psycopg
 from fastapi import FastAPI, HTTPException
 
-app = FastAPI(title="Inventory Service")
+from services.inventory.database import get_connection
 
-products = {
-    101: {"name": "Keyboard", "quantity": 10},
-    102: {"name": "Mouse", "quantity": 5},
-}
+app = FastAPI(title="Inventory Service")
 
 
 @app.get("/health")
@@ -15,9 +13,23 @@ def health_check():
 
 @app.get("/inventory/{product_id}")
 def get_inventory(product_id: int):
-    product = products.get(product_id)
+    try:
+        with get_connection() as connection:
+            product = connection.execute(
+                """
+                SELECT id AS product_id, name, quantity
+                FROM products
+                WHERE id = %s
+                """,
+                (product_id,),
+            ).fetchone()
+    except psycopg.OperationalError:
+        raise HTTPException(
+            status_code=503,
+            detail="Inventory database unavailable",
+        )
 
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    return {"product_id": product_id, **product}
+    return product
