@@ -114,11 +114,6 @@ infra/       config for Prometheus, Loki, Tempo, Alertmanager, Grafana
 scripts/     demo scenario script
 ```
 
-## Optional: AI summary
-
-TraceOps can ask a free local AI model ([Ollama](https://ollama.com)) to write the report
-in plain English. It's off by default; everything works without it. To turn it on, install
-Ollama, run `ollama pull llama3.2`, and set `EXPLAIN_PROVIDER=ollama` in `.env`.
 
 ## Limitations
 
