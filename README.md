@@ -1,202 +1,127 @@
 # TraceOps
 
-TraceOps is an incident investigator for distributed applications. When an alert fires, it
-pulls **metrics** (Prometheus), **traces** (Tempo) and **logs** (Loki) for the affected time
-window. It finds where the failure *started*, as opposed to where it was *noticed*, and records
-a structured incident with every claim linked to the evidence behind it.
+When one part of an app breaks, every part that depends on it starts showing errors too.
+TraceOps figures out **which part actually broke**.
 
-It ships with a small three-service demo application and a fault injector, so you can break
-things on purpose and watch TraceOps work out what happened.
+It comes with a small demo shop you can break on purpose, and a dashboard that shows
+what TraceOps found.
+
+**Built with:** Python, FastAPI, PostgreSQL, React, TypeScript, Docker, OpenTelemetry,
+Prometheus, Grafana Loki, Grafana Tempo
+
+## The idea
+
+The demo shop has four parts in a line. Every customer request passes through all of them:
 
 ```
-                ┌──────────── demo application ────────────┐
-  traffic ──►  Gateway :8003 ──► Orders :8002 ──► Inventory :8001 ──► PostgreSQL :5432
-                   │                 │                  │
-                   └── OpenTelemetry traces + logs (OTLP) ──► Tempo :3200 / Loki :3100
-                   └── /metrics scraped every 5 s ─────────► Prometheus :9090
-                                                                 │ alert rules
-                                                                 ▼
-                                                           Alertmanager :9093
-                                                                 │ webhook
-                                                                 ▼
-  Dashboard :5173 (React) ◄── REST ── TraceOps API :8000 ── queries Prometheus, Tempo, Loki
-                                          │
-                                          └── incidents ──► TraceOps DB (PostgreSQL :5433)
+Customer → Gateway → Orders → Inventory → Database
 ```
 
-## What it does (implemented and verified)
+If the database stops working, Inventory fails, so Orders fails, so the Gateway fails.
+You get errors from **every** part, but only one of them is the real cause.
 
-1. **Instrumented services.** Every request gets a W3C `traceparent` header, so one request has
-   *one* trace ID across gateway → orders → inventory → PostgreSQL (database calls have their
-   own spans). Logs are JSON and carry the same `trace_id`. Prometheus metrics record request
-   counts and latency per route and status.
-2. **Alerting.** Prometheus rules (`HighErrorRate`, `HighLatency`, `ServiceDown`) send alerts
-   to Alertmanager, which sends them to TraceOps' webhook.
-3. **Incident correlation.** One failure trips several alerts. Alerts arriving while an
-   incident is open are merged into it, and a new firing alert re-runs the investigation.
-   When every alert has resolved, the incident is marked resolved.
-4. **Investigation** ([backend/traceops/investigator.py](backend/traceops/investigator.py)):
-   - *Symptoms* (observed): per-service 5xx ratio, p95 latency and scrape health, each compared
-     with the previous window of the same length.
-   - *Error origin* (inferred): in each failed trace, the error spans form a chain from the
-     database up to the gateway. The **deepest error span with no failing children** is where
-     the failure started. Traces are grouped by origin.
-   - *Bottlenecks*: for slow or timed-out requests, the span with the largest **self time**
-     (its duration minus its children's) is where the time went.
-   - *Logs*: error logs from the implicated service, plus every log line that shares the
-     representative trace's `trace_id`.
-   - *Confidence*: `0.6 × share of failed traces explained + 0.2 × logs agree + 0.2 × metrics
-     agree`. This is a transparent heuristic, not a probability, and the report says so.
-   - *Uncertainty*: missing data sources, competing failure points, and caveats specific to
-     the failure type.
-5. **Dashboard** (React and TypeScript), written for people who aren't observability experts:
-   - a live map of the demo shop (Gateway → Orders → Inventory → Database) showing what's working;
-   - a guided 3-step demo: send traffic, break something, watch the incident appear;
-   - each incident told as a story: the most likely cause in one sentence, what users
-     experienced, a map showing where it started (red) and what it affected (orange), one real
-     failed request step by step, why TraceOps thinks so (traces, logs, metrics as a checklist),
-     what it's unsure about, and what to check next;
-   - the raw evidence, exact queries and Grafana links, folded under "Technical details";
-   - a "How it works" page with a glossary.
-6. **Optional AI explanation.** A local Ollama model can turn the report into prose that cites
-   evidence IDs. It's off by default; the deterministic summary needs no LLM.
+TraceOps finds it like this:
 
-## Quick start
+1. **Each service records what it does:** request counts and timings (metrics), error
+   messages (logs), and the path each request took through the services (traces).
+2. **An alert fires** when too many requests fail or get slow.
+3. **TraceOps looks at failed requests step by step.** The first step that failed is where
+   the problem started. It checks that the error logs and the numbers agree.
+4. **It saves a report:** what broke, how sure it is, and the evidence.
 
-Prerequisites: Docker Desktop and Node.js 18+ (Python 3.10+ is only needed for the tests and
-the demo script).
+## Run it
+
+You need **Docker Desktop** and **Node.js**.
 
 ```bash
-cp .env.example .env            # then edit the password (skip if you already have a .env)
-docker compose up -d --build    # 11 containers; first build takes a few minutes
-cd frontend && npm install && npm run dev
+git clone https://github.com/sanchayi21/TraceOps.git
+cd TraceOps
+cp .env.example .env
+docker compose up -d --build
+```
+
+Then start the dashboard:
+
+```bash
+cd frontend
+npm install
+npm run dev
 ```
 
 Open **http://localhost:5173**.
 
-| URL | What |
+To stop everything: `docker compose down`.
+
+## Try it
+
+On the dashboard:
+
+1. Click **Start traffic**. This sends pretend customers to the shop.
+2. Wait 30 seconds, then pick something to break, e.g. **Database goes offline**.
+3. Wait about a minute. An incident appears. Click it to see what TraceOps found.
+4. Click **Fix it**.
+
+TraceOps is never told what you broke. It works it out from the evidence.
+
+| What you break | What TraceOps should say |
 |---|---|
-| http://localhost:5173 | TraceOps dashboard |
-| http://localhost:8000/docs | TraceOps API (Swagger UI) |
-| http://localhost:8003/orders/check/101 | Demo app via the gateway |
-| http://localhost:3000 | Grafana: raw metrics, traces, logs |
-| http://localhost:9090/alerts | Prometheus alert state |
+| Database goes offline | The database stopped accepting connections |
+| Database gets slow | Database queries became very slow |
+| Database gets very slow (requests time out) | Database queries became very slow. **Not** Orders, even though Orders is where the timeout error shows up |
+| `docker compose stop inventory` | The Inventory service is down |
 
-Stop with `docker compose down`. Data volumes are kept; add `-v` to delete them.
+There's also a script that runs a scenario and prints the result:
+`python scripts/demo.py db-down` (or `slow-db`, `timeout`, `inventory-down`).
 
-## Running a demonstration
+## How sure is it?
 
-From the dashboard: **Start traffic**, wait about 30 s, click a fault, then watch an incident
-appear (usually 30–60 s later). Click **Clear fault** afterwards.
+TraceOps gives each finding a simple score:
 
-Or run a scripted scenario that does the same and prints the findings:
+- Most of the score comes from **how many failed requests broke at the same place**.
+- The rest comes from whether **the error logs agree** and whether **the numbers agree**.
 
-```bash
-backend/.venv/Scripts/python scripts/demo.py db-down     # Windows venv path
-python scripts/demo.py slow-db                           # any Python with httpx installed
-```
+It's a rule of thumb, not a precise probability, and the report says what it isn't sure about.
 
-| Scenario | What is broken | What TraceOps should conclude |
-|---|---|---|
-| `db-down` | inventory's DB connections fail | **postgresql** unavailable (from inventory); the error travels inventory 503 → orders 502 → gateway 502 |
-| `slow-db` | every DB query takes 1.5 s (real `pg_sleep`) | slow dependency: the `SELECT pg_sleep` span in PostgreSQL |
-| `timeout` | DB queries take 5 s, so orders times out after 4 s | slow dependency in PostgreSQL, *not* orders, even though orders is where the timeout error appears |
-| `inventory-down` | `docker compose stop inventory` | **inventory** unreachable, corroborated by Prometheus's `ServiceDown` |
-| `healthy` | nothing | no incident |
+## Bugs I found while building it
 
-Faults are injected through the inventory service's `/chaos` endpoint, which exists only
-when `CHAOS_ENABLED=true`. TraceOps is never told which fault is active; it works only from
-the telemetry.
+1. **The app blamed the wrong service.** Orders and Inventory both waited 3 seconds before
+   giving up. When the database broke, Orders gave up first and reported "can't reach
+   Inventory", even though Inventory was fine. Fixed by making inner services give up sooner.
+2. **Logs and traces didn't match up.** Tempo shortens some trace IDs by dropping the leading
+   zero, so about 1 in 16 traces couldn't be matched to its logs. Fixed by padding IDs back.
+3. **"Can't connect" was reported as "too slow".** In the httpx library, a connection timeout
+   counts as a kind of timeout, so a stopped service looked slow instead of down.
+4. **Healthy services looked down.** When Inventory was stopped, other services got stuck
+   waiting on it, and Prometheus couldn't read their metrics either. Fixed by making the
+   metrics endpoint async.
 
 ## Tests
 
 ```bash
-# backend: trace analysis, investigator, alert correlation, API (no Docker needed)
-cd backend && .venv/Scripts/python -m pytest -q
-# demo services: status mapping, fault injection, metrics
-backend/.venv/Scripts/python -m pytest -q services/tests
+cd backend && python -m pytest
+python -m pytest services/tests
 ```
 
-The investigator tests use synthetic traces in the same JSON shape Tempo returns, so the
-correlation logic is tested without any infrastructure. To set up the venv from scratch:
-`python -m venv backend/.venv`, then `pip install -r backend/requirements.txt -r
-services/requirements.txt`.
+The tests use fake traces, so they run without Docker.
 
 ## Project layout
 
 ```
-backend/
-  main.py                    API routes, webhook, background investigations
-  traceops/
-    trace_analysis.py        pure logic: parse traces, error origins, self time
-    investigator.py          the workflow: metrics → traces → logs → scored report
-    telemetry_clients.py     Prometheus / Tempo / Loki HTTP clients
-    alerts.py                Alertmanager payload → incident (merge, resolve)
-    store.py                 PostgreSQL storage (report kept as JSONB)
-    models.py                report/incident schema (symptoms vs hypotheses vs evidence)
-    explain.py               deterministic summary + optional Ollama explanation
-    demo.py                  demo controls (fault injection, traffic generator)
-  tests/
-services/
-  common/telemetry.py        OpenTelemetry tracing + JSON logs + Prometheus metrics
-  common/chaos.py            fault injection state and /chaos endpoints
-  gateway/ orders/ inventory/
-  tests/
-infra/                       Prometheus rules, Alertmanager, Tempo, Loki, Grafana config
-frontend/                    React + TypeScript dashboard (Vite)
-scripts/demo.py              scripted demonstration scenarios
+backend/     TraceOps: API, investigator, incident storage
+services/    the demo shop: gateway, orders, inventory
+frontend/    React dashboard
+infra/       config for Prometheus, Loki, Tempo, Alertmanager, Grafana
+scripts/     demo scenario script
 ```
 
-## Design decisions
+## Optional: AI summary
 
-- **TraceOps has its own database** (`traceops-db`, port 5433). If it shared the demo
-  app's PostgreSQL, the `db-down` incident would stop TraceOps from recording it.
-- **Timeouts nest inward:** DB connect 2 s < orders→inventory 4 s < gateway→orders 6 s. When
-  the inner timeout is shorter, the service closest to the problem reports it first.
-- **Pull, don't push, for investigation.** Services only emit standard telemetry; TraceOps
-  queries the telemetry backends afterwards, so investigating needs no changes to the services.
-- **Reports are JSONB, validated by Pydantic.** The report shape changes as the investigator
-  improves; the fields used for listing and filtering are real columns.
-- **No Celery/Redis.** An investigation takes a few seconds, so FastAPI `BackgroundTasks`
-  is enough. A queue would only be justified by long or very frequent investigations.
-
-## Real problems found while building it
-
-These came up while running the scenarios, and each one is now fixed and covered by a test:
-
-1. **Misattributed outage.** The original code had a 3 s timeout both for inventory's DB
-   connection and for orders' call to inventory. With the database down, orders gave up first
-   and reported *"Cannot reach Inventory Service"*, blaming the wrong component. The fix was to
-   nest the timeouts.
-2. **Tempo drops leading zeros from trace IDs** in search results (31 characters instead of 32),
-   so joining traces to logs by `trace_id` silently failed for about 1 in 16 traces. TraceOps
-   now pads IDs to 32 characters.
-3. **`ConnectTimeout` is a subclass of `TimeoutException` in httpx**, so a stopped service was
-   reported as "timed out" (504) instead of "unreachable" (503). TraceOps classifies by the
-   span's exception type; the services now catch connect errors first.
-4. **Thread-pool starvation made healthy services look down.** With inventory stopped, DNS
-   lookups for it hung inside Docker and filled FastAPI's thread pool. The sync `/metrics`
-   handler then couldn't run, so Prometheus marked the gateway and orders as down too.
-   `/metrics` is now `async`.
-
-## Optional: AI explanations with a local model (free)
-
-1. Install [Ollama](https://ollama.com) and run `ollama pull llama3.2`.
-2. In `.env`, set `EXPLAIN_PROVIDER=ollama`, then run `docker compose up -d traceops`.
-3. Click **Explain with AI** on an incident.
-
-The model only receives the structured report and is told to use only those facts and to
-cite evidence IDs. Treat its output as a readable rewording; the evidence remains the source
-of truth. No paid API is used.
+TraceOps can ask a free local AI model ([Ollama](https://ollama.com)) to write the report
+in plain English. It's off by default; everything works without it. To turn it on, install
+Ollama, run `ollama pull llama3.2`, and set `EXPLAIN_PROVIDER=ollama` in `.env`.
 
 ## Limitations
 
-- The demo runs on one machine; storage for Tempo and Loki is in-container and resets when
-  those containers are recreated.
-- Investigation examines at most 40 traces per run, which is fine for a demo but would need
-  sampling strategies at scale.
-- Correlation is by time window plus trace structure. It doesn't yet use a service dependency
-  graph, deployment events or configuration changes.
-- The confidence formula is a hand-tuned heuristic, not a calibrated model.
-- No authentication on the API or dashboard; everything binds to `127.0.0.1` and is meant for
-  local use only.
+- Runs on one machine, for demos. Not built for a large production system.
+- Looks at up to 40 failed requests per investigation.
+- No login. Everything only listens on your own computer (`127.0.0.1`).
