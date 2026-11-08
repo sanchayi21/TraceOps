@@ -1,0 +1,37 @@
+# Alert rules. When one fires for its `for:` duration, Prometheus sends it to
+# Alertmanager, which forwards it to the TraceOps webhook.
+groups:
+  - name: demo-services
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum by (job) (rate(http_requests_total{status=~"5.."}[1m]))
+            /
+            sum by (job) (rate(http_requests_total[1m]))
+          ) > 0.2
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }}: {{ $value | humanizePercentage }} of requests return 5xx"
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[1m]))
+          ) > 1
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }}: p95 latency is {{ $value | humanizeDuration }}"
+
+      - alert: ServiceDown
+        expr: up{job=~"gateway|orders|inventory"} == 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is not responding to Prometheus scrapes"

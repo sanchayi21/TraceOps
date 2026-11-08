@@ -1,0 +1,12 @@
+route:
+  receiver: traceops
+  group_by: ["alertname"]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+
+receivers:
+  - name: traceops
+    webhook_configs:
+      - url: http://traceops:8000/api/alerts/alertmanager
+        send_resolved: true

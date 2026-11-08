@@ -1,4 +1,17 @@
+# TraceOps local environment.
+#
+#   docker compose up -d --build      start everything
+#   docker compose ps                 check status
+#   docker compose down               stop (data volumes are kept)
+#
+# All ports bind to 127.0.0.1 only, so nothing is exposed to your network.
+
+x-service-telemetry: &service-telemetry
+  OTEL_TRACES_ENDPOINT: http://tempo:4318/v1/traces
+  OTEL_LOGS_ENDPOINT: http://loki:3100/otlp/v1/logs
+
 services:
+  # ---------------------------------------------------------------- demo app
   postgres:
     image: postgres:17
     environment:
@@ -15,5 +28,124 @@ services:
       timeout: 5s
       retries: 10
 
+  inventory:
+    build: { context: ., dockerfile: services/Dockerfile }
+    environment:
+      <<: *service-telemetry
+      SERVICE_MODULE: inventory
+      PORT: "8001"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      CHAOS_ENABLED: "true"
+    ports: ["127.0.0.1:8001:8001"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  orders:
+    build: { context: ., dockerfile: services/Dockerfile }
+    environment:
+      <<: *service-telemetry
+      SERVICE_MODULE: orders
+      PORT: "8002"
+      INVENTORY_URL: http://inventory:8001
+    ports: ["127.0.0.1:8002:8002"]
+    depends_on: [inventory]
+
+  gateway:
+    build: { context: ., dockerfile: services/Dockerfile }
+    environment:
+      <<: *service-telemetry
+      SERVICE_MODULE: gateway
+      PORT: "8003"
+      ORDERS_URL: http://orders:8002
+    ports: ["127.0.0.1:8003:8003"]
+    depends_on: [orders]
+
+  # ------------------------------------------------------- observability
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./infra/tempo/tempo.yaml:/etc/tempo.yaml:ro
+    ports:
+      - "127.0.0.1:3200:3200"
+      - "127.0.0.1:4318:4318"
+
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./infra/loki/loki.yaml:/etc/loki/loki.yaml:ro
+    ports: ["127.0.0.1:3100:3100"]
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["127.0.0.1:9090:9090"]
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    volumes:
+      - ./infra/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports: ["127.0.0.1:9093:9093"]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./infra/grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+    ports: ["127.0.0.1:3000:3000"]
+
+  # -------------------------------------------------------------- TraceOps
+  # TraceOps keeps incidents in its OWN database, so an outage of the demo
+  # app's database never stops the investigator from recording it.
+  traceops-db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: traceops
+    ports: ["127.0.0.1:5433:5432"]
+    volumes:
+      - traceops_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d traceops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  traceops:
+    build: { context: ./backend }
+    environment:
+      TRACEOPS_DB_HOST: traceops-db
+      TRACEOPS_DB_PORT: "5432"
+      TRACEOPS_DB_NAME: traceops
+      TRACEOPS_DB_USER: ${POSTGRES_USER}
+      TRACEOPS_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      PROMETHEUS_URL: http://prometheus:9090
+      TEMPO_URL: http://tempo:3200
+      LOKI_URL: http://loki:3100
+      DEMO_SERVICE_URLS: gateway=http://gateway:8003,orders=http://orders:8002,inventory=http://inventory:8001
+      EXPLAIN_PROVIDER: ${EXPLAIN_PROVIDER:-none}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      traceops-db: { condition: service_healthy }
+
 volumes:
   inventory_data:
+  traceops_data:
